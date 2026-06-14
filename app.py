@@ -1,5 +1,8 @@
 import requests
 import streamlit as st
+import asyncio
+import threading
+from concurrent.futures import Future
 
 # =============================
 # CONFIG
@@ -61,17 +64,86 @@ def goto_details(tmdb_id: int):
 
 
 # =============================
-# API HELPERS
+# LOCAL BACKEND INTEGRATION
 # =============================
+@st.cache_resource
+def load_backend_resources():
+    import main
+    main.load_pickles()
+    return main
+
+try:
+    main = load_backend_resources()
+except Exception as e:
+    st.error(f"Failed to load local backend resources: {e}")
+
+def run_async(coro):
+    future = Future()
+    def target():
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(coro)
+            future.set_result(result)
+        except Exception as e:
+            future.set_exception(e)
+        finally:
+            loop.close()
+    t = threading.Thread(target=target)
+    t.start()
+    t.join()
+    return future.result()
+
 @st.cache_data(ttl=30)  # short cache for autocomplete
 def api_get_json(path: str, params: dict | None = None):
+    params = params or {}
     try:
-        r = requests.get(f"{API_BASE}{path}", params=params, timeout=25)
-        if r.status_code >= 400:
-            return None, f"HTTP {r.status_code}: {r.text[:300]}"
-        return r.json(), None
+        # 1) TMDB Search
+        if path == "/tmdb/search":
+            query = params.get("query", "")
+            page = int(params.get("page", 1))
+            res = run_async(main.tmdb_search(query=query, page=page))
+            return res, None
+
+        # 2) Home Feed
+        elif path == "/home":
+            category = params.get("category", "popular")
+            limit = int(params.get("limit", 24))
+            res = run_async(main.home(category=category, limit=limit))
+            serialized = [c.model_dump() if hasattr(c, "model_dump") else c.dict() for c in res]
+            return serialized, None
+
+        # 3) Movie Details
+        elif path.startswith("/movie/id/"):
+            tmdb_id = int(path.split("/")[-1])
+            res = run_async(main.movie_details_route(tmdb_id=tmdb_id))
+            serialized = res.model_dump() if hasattr(res, "model_dump") else res.dict()
+            return serialized, None
+
+        # 4) Search Bundle
+        elif path == "/movie/search":
+            query = params.get("query", "")
+            tfidf_top_n = int(params.get("tfidf_top_n", 12))
+            genre_limit = int(params.get("genre_limit", 12))
+            res = run_async(main.search_bundle(query=query, tfidf_top_n=tfidf_top_n, genre_limit=genre_limit))
+            serialized = res.model_dump() if hasattr(res, "model_dump") else res.dict()
+            return serialized, None
+
+        # 5) Recommend Genre
+        elif path == "/recommend/genre":
+            tmdb_id = int(params.get("tmdb_id"))
+            limit = int(params.get("limit", 18))
+            res = run_async(main.recommend_genre(tmdb_id=tmdb_id, limit=limit))
+            serialized = [c.model_dump() if hasattr(c, "model_dump") else c.dict() for c in res]
+            return serialized, None
+
+        else:
+            return None, f"Unknown local path: {path}"
+
     except Exception as e:
-        return None, f"Request failed: {e}"
+        import traceback
+        traceback.print_exc()
+        return None, f"Local call failed: {e}"
 
 
 def poster_grid(cards, cols=6, key_prefix="grid"):
